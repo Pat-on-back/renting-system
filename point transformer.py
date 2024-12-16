@@ -1,190 +1,330 @@
+import copy
+import os
+import os.path as osp
+import sys
+from dataclasses import dataclass
+from typing import List, Literal, Optional
+
 import torch
-import torch.nn as nn
+import torch.utils.data
+from torch import Tensor
 
-from lib.pointops.functions import pointops
-
-
-class PointTransformerLayer(nn.Module):
-    def __init__(self, in_planes, out_planes, share_planes=8, nsample=16):
-        super().__init__()
-        self.mid_planes = mid_planes = out_planes // 1
-        self.out_planes = out_planes
-        self.share_planes = share_planes
-        self.nsample = nsample
-        # linear_q、linear_k和linear_v是三个全连接层（线性层），分别生成查询、键和值的嵌入
-        self.linear_q = nn.Linear(in_planes, mid_planes)
-        self.linear_k = nn.Linear(in_planes, mid_planes)
-        self.linear_v = nn.Linear(in_planes, out_planes)
-        # linear_p用于处理点间相对位置的特征。将相对位置(3维)映射到输出通道维度
-        self.linear_p = nn.Sequential(nn.Linear(3, 3), nn.BatchNorm1d(3), nn.ReLU(inplace=True), nn.Linear(3, out_planes))
-        # linear_w用于生成注意力权重
-        self.linear_w = nn.Sequential(nn.BatchNorm1d(mid_planes), nn.ReLU(inplace=True),
-                                    nn.Linear(mid_planes, mid_planes // share_planes),
-                                    nn.BatchNorm1d(mid_planes // share_planes), nn.ReLU(inplace=True),
-                                    nn.Linear(out_planes // share_planes, out_planes // share_planes))
-        self.softmax = nn.Softmax(dim=1)
-    def forward(self, pxo) -> torch.Tensor:
-        p, x, o = pxo  # (n, 3), (n, c), (b)
-        x_q, x_k, x_v = self.linear_q(x), self.linear_k(x), self.linear_v(x)  # (n, c)
-        # 以 nsample 为采样数量，从点云中提取局部邻域。x_k 包含键特征和点相对位置，而 x_v 仅包含值特征。
-        x_k = pointops.queryandgroup(self.nsample, p, p, x_k, None, o, o, use_xyz=True)  # (n, nsample, 3+c)
-        x_v = pointops.queryandgroup(self.nsample, p, p, x_v, None, o, o, use_xyz=False)  # (n, nsample, c)
-        p_r, x_k = x_k[:, :, 0:3], x_k[:, :, 3:]
-        # 将点相对位置 p_r 通过 linear_p 处理，得到位置编码
-        for i, layer in enumerate(self.linear_p): p_r = layer(p_r.transpose(1, 2).contiguous()).transpose(1, 2).contiguous() if i == 1 else layer(p_r)    # (n, nsample, c)
-        # 将 x_k 减去查询 x_q 并添加位置编码信息 p_r
-        w = x_k - x_q.unsqueeze(1) + p_r.view(p_r.shape[0], p_r.shape[1], self.out_planes // self.mid_planes, self.mid_planes).sum(2)  # (n, nsample, c)
-        # 将 w 通过 linear_w 序列层处理，生成最终的注意力权重
-        for i, layer in enumerate(self.linear_w): w = layer(w.transpose(1, 2).contiguous()).transpose(1, 2).contiguous() if i % 3 == 0 else layer(w)
-        w = self.softmax(w)  # (n, nsample, c)
-        n, nsample, c = x_v.shape; s = self.share_planes
-        # 将值 x_v 与位置编码 p_r 相加，并与权重 w 相乘以生成最终的注意力加权输出 x
-        x = ((x_v + p_r).view(n, nsample, s, c // s) * w.unsqueeze(2)).sum(1).view(n, c)
-        return x
+import torch_geometric.typing
+from torch_geometric.data import Data
+from torch_geometric.index import index2ptr, ptr2index
+from torch_geometric.io import fs
+from torch_geometric.typing import pyg_lib
+from torch_geometric.utils import index_sort, narrow, select, sort_edge_index
+from torch_geometric.utils.map import map_index
 
 
-class TransitionDown(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, nsample=16):
-        super().__init__()
-        self.stride, self.nsample = stride, nsample
-        # 如果 stride 不等于 1，说明需要下采样
-        if stride != 1:
-            self.linear = nn.Linear(3+in_planes, out_planes, bias=False)
-            self.pool = nn.MaxPool1d(nsample)
+@dataclass
+class Partition:
+    indptr: Tensor  # CSR格式的指针数组
+    index: Tensor  # 节点索引
+    partptr: Tensor  # 每个分区的节点指针
+    node_perm: Tensor  # 节点排序
+    edge_perm: Tensor  # 边排序
+    sparse_format: Literal['csr', 'csc']  # 稀疏矩阵的格式，CSR或CSC
+
+
+class ClusterData(torch.utils.data.Dataset):
+    .. note::
+        底层的 METIS 算法要求输入图为无向图。
+
+    参数:
+        data (torch_geometric.data.Data): 图数据对象。
+        num_parts (int): 划分的子图数量。
+        recursive (bool, 可选): 如果为 True，使用多层递归二分法进行划分，否则使用多层k-way划分。
+        save_dir (str, 可选): 如果设置，会将划分后的数据保存在该目录中以便下次复用。
+        filename (str, 可选): 保存的划分文件的名称。
+        log (bool, 可选): 是否打印进度信息。默认为 True。
+        keep_inter_cluster_edges (bool, 可选): 是否保留跨集群边连接。默认为 False。
+        sparse_format (str, 可选): 用于计算划分的稀疏矩阵格式，默认为 "csr"。
+    """
+    def __init__(
+        self,
+        data,
+        num_parts: int,
+        recursive: bool = False,
+        save_dir: Optional[str] = None,
+        filename: Optional[str] = None,
+        log: bool = True,
+        keep_inter_cluster_edges: bool = False,
+        sparse_format: Literal['csr', 'csc'] = 'csr',
+    ):
+        # 确保图数据中包含边信息
+        assert data.edge_index is not None
+        assert sparse_format in ['csr', 'csc']
+
+        self.num_parts = num_parts
+        self.recursive = recursive
+        self.keep_inter_cluster_edges = keep_inter_cluster_edges
+        self.sparse_format = sparse_format
+
+        # 设置文件路径，用于保存划分结果
+        recursive_str = '_recursive' if recursive else ''
+        root_dir = osp.join(save_dir or '', f'part_{num_parts}{recursive_str}')
+        path = osp.join(root_dir, filename or 'metis.pt')
+
+        # 如果已经存在划分结果文件，则加载
+        if save_dir is not None and osp.exists(path):
+            self.partition = fs.torch_load(path)
         else:
-            self.linear = nn.Linear(in_planes, out_planes, bias=False)
-        self.bn = nn.BatchNorm1d(out_planes)
-        self.relu = nn.ReLU(inplace=True)
+            if log:  # 如果需要日志，则输出划分进度
+                print('正在计算 METIS 划分...', file=sys.stderr)
+
+            # 调用 METIS 算法进行图划分
+            cluster = self._metis(data.edge_index, data.num_nodes)
+            self.partition = self._partition(data.edge_index, cluster)
+
+            # 如果设置了保存目录，则保存划分结果
+            if save_dir is not None:
+                os.makedirs(root_dir, exist_ok=True)
+                torch.save(self.partition, path)
+
+            if log:  # 如果需要日志，则输出划分完成信息
+                print('完成!', file=sys.stderr)
+
+        # 根据划分结果对数据进行重新排列
+        self.data = self._permute_data(data, self.partition)
+
+    def _metis(self, edge_index: Tensor, num_nodes: int) -> Tensor:
+        # 通过 METIS 算法计算节点级别的划分结果
+        if self.sparse_format == 'csr':
+            # 计算 CSR 格式的表示
+            row, index = sort_edge_index(edge_index, num_nodes=num_nodes)
+            indptr = index2ptr(row, size=num_nodes)
+        else:
+            # 计算 CSC 格式的表示
+            index, col = sort_edge_index(edge_index, num_nodes=num_nodes, sort_by_row=False)
+            indptr = index2ptr(col, size=num_nodes)
+
+        cluster: Optional[Tensor] = None
+
+        # 尝试使用 torch_sparse 库进行图划分
+        if torch_geometric.typing.WITH_TORCH_SPARSE:
+            try:
+                cluster = torch.ops.torch_sparse.partition(
+                    indptr.cpu(),
+                    index.cpu(),
+                    None,
+                    self.num_parts,
+                    self.recursive,
+                ).to(edge_index.device)
+            except (AttributeError, RuntimeError):
+                pass
+
+        # 如果没有成功，尝试使用 pyg_lib 中的 METIS 算法
+        if cluster is None and torch_geometric.typing.WITH_METIS:
+            cluster = pyg_lib.partition.metis(
+                indptr.cpu(),
+                index.cpu(),
+                self.num_parts,
+                recursive=self.recursive,
+            ).to(edge_index.device)
+
+        # 如果仍然无法使用 METIS 划分，则抛出错误
+        if cluster is None:
+            raise ImportError(f"'{self.__class__.__name__}' 需要 'pyg-lib' 或 'torch-sparse'")
+
+        return cluster
+
+    def _partition(self, edge_index: Tensor, cluster: Tensor) -> Partition:
+        # 根据节点级和边级的排列，计算并返回新的划分信息
+
+        # 对 cluster 进行排序，并计算每个子图的边界 `partptr`
+        cluster, node_perm = index_sort(cluster, max_value=self.num_parts)
+        partptr = index2ptr(cluster, size=self.num_parts)
+
+        # 根据节点排列对 `edge_index` 进行重排列
+        edge_perm = torch.arange(edge_index.size(1), device=edge_index.device)
+        arange = torch.empty_like(node_perm)
+        arange[node_perm] = torch.arange(cluster.numel(),
+                                         device=cluster.device)
+        edge_index = arange[edge_index]
+
+        # 计算最终的 CSR 格式的表示
+        (row, col), edge_perm = sort_edge_index(
+            edge_index,
+            edge_attr=edge_perm,
+            num_nodes=cluster.numel(),
+            sort_by_row=self.sparse_format == 'csr',
+        )
+        if self.sparse_format == 'csr':
+            indptr, index = index2ptr(row, size=cluster.numel()), col
+        else:
+            indptr, index = index2ptr(col, size=cluster.numel()), row
+
+        return Partition(indptr, index, partptr, node_perm, edge_perm,
+                         self.sparse_format)
+
+    def _permute_data(self, data: Data, partition: Partition) -> Data:
+        # 根据划分结果对节点和边的属性进行排列
+        out = copy.copy(data)
+        for key, value in data.items():
+            if key == 'edge_index':
+                continue
+            elif data.is_node_attr(key):
+                cat_dim = data.__cat_dim__(key, value)
+                out[key] = select(value, partition.node_perm, dim=cat_dim)
+            elif data.is_edge_attr(key):
+                cat_dim = data.__cat_dim__(key, value)
+                out[key] = select(value, partition.edge_perm, dim=cat_dim)
+        out.edge_index = None
+
+        return out
+
+    def __len__(self) -> int:
+        # 返回划分的子图数量
+        return self.partition.partptr.numel() - 1
+
+    def __getitem__(self, idx: int) -> Data:
+    # 获取第 idx 个子图的数据
+    # 从分区信息中提取当前子图的节点范围
+    node_start = int(self.partition.partptr[idx])  # 当前子图的起始节点索引
+    node_end = int(self.partition.partptr[idx + 1])  # 当前子图的结束节点索引
+    node_length = node_end - node_start  # 当前子图中节点的数量
+
+    # 获取当前子图的边的指针信息
+    indptr = self.partition.indptr[node_start:node_end + 1]  # 当前子图的指针数组
+    edge_start = int(indptr[0])  # 当前子图的边的起始位置
+    edge_end = int(indptr[-1])  # 当前子图的边的结束位置
+    edge_length = edge_end - edge_start  # 当前子图中边的数量
+    indptr = indptr - edge_start  # 对指针数组进行偏移，保证从 0 开始
+
+    # 根据稀疏矩阵的格式选择行列的提取方式
+    if self.sparse_format == 'csr':
+        # 如果是 CSR 格式，行索引通过 indptr 转换得到
+        row = ptr2index(indptr)  # 获取边的行索引（节点端）
+        # 获取边的列索引（与当前子图相关的节点）
+        col = self.partition.index[edge_start:edge_end]
         
-    def forward(self, pxo):
-        p, x, o = pxo  # (n, 3), (n, c), (b)
-        if self.stride != 1:
-            n_o, count = [o[0].item() // self.stride], o[0].item() // self.stride
-            for i in range(1, o.shape[0]):
-                count += (o[i].item() - o[i-1].item()) // self.stride
-                n_o.append(count)
-            n_o = torch.cuda.IntTensor(n_o)
-            # 执行最远点采样，从 p 中选择子集，生成下采样后的新点 n_p
-            idx = pointops.furthestsampling(p, o, n_o)  # (m)
-            n_p = p[idx.long(), :]  # (m, 3)
-            # 从 p 到 n_p 的邻域查询，将邻域特征组装成新张量 x，其中包含 n_p 点的坐标、特征和邻域点信息
-            x = pointops.queryandgroup(self.nsample, p, n_p, x, None, o, n_o, use_xyz=True)  # (m, 3+c, nsample)
-            x = self.relu(self.bn(self.linear(x).transpose(1, 2).contiguous()))  # (m, c, nsample)
-            # 使用 MaxPool1d 对邻域维度进行池化，得到 m 个下采样点的特征表示。
-            x = self.pool(x).squeeze(-1)  # (m, c)
-            p, o = n_p, n_o
-        else:
-            x = self.relu(self.bn(self.linear(x)))  # (n, c)
-        return [p, x, o]
-
-class TransitionUp(nn.Module):
-    def __init__(self, in_planes, out_planes=None):
-        super().__init__()
-        if out_planes is None:
-            self.linear1 = nn.Sequential(nn.Linear(2*in_planes, in_planes), nn.BatchNorm1d(in_planes), nn.ReLU(inplace=True))
-            self.linear2 = nn.Sequential(nn.Linear(in_planes, in_planes), nn.ReLU(inplace=True))
-        else:
-            self.linear1 = nn.Sequential(nn.Linear(out_planes, out_planes), nn.BatchNorm1d(out_planes), nn.ReLU(inplace=True))
-            self.linear2 = nn.Sequential(nn.Linear(in_planes, out_planes), nn.BatchNorm1d(out_planes), nn.ReLU(inplace=True))
+        # 如果不保留集群间的边，则进行筛选，只保留当前子图内的边
+        if not self.keep_inter_cluster_edges:
+            edge_mask = (col >= node_start) & (col < node_end)  # 判断边的目标节点是否在当前子图内
+            row = row[edge_mask]  # 只保留符合条件的行
+            col = col[edge_mask] - node_start  # 只保留符合条件的列，并对列索引进行偏移
+    else:
+        # 如果是 CSC 格式，列索引通过 indptr 转换得到
+        col = ptr2index(indptr)  # 获取边的列索引（节点端）
+        # 获取边的行索引（与当前子图相关的节点）
+        row = self.partition.index[edge_start:edge_end]
         
-    def forward(self, pxo1, pxo2=None):
-        # 如果 pxo2 为 None，只对单一特征 pxo1 进行上采样
-        if pxo2 is None:
-            _, x, o = pxo1  # (n, 3), (n, c), (b)
-            x_tmp = []
-            for i in range(o.shape[0]):
-                if i == 0:
-                    s_i, e_i, cnt = 0, o[0], o[0]
-                else:
-                    s_i, e_i, cnt = o[i-1], o[i], o[i] - o[i-1]
-                x_b = x[s_i:e_i, :]
-                x_b = torch.cat((x_b, self.linear2(x_b.sum(0, True) / cnt).repeat(cnt, 1)), 1)
-                x_tmp.append(x_b)
-            x = torch.cat(x_tmp, 0)
-            x = self.linear1(x)
+        # 如果不保留集群间的边，则进行筛选，只保留当前子图内的边
+        if not self.keep_inter_cluster_edges:
+            edge_mask = (row >= node_start) & (row < node_end)  # 判断边的起始节点是否在当前子图内
+            col = col[edge_mask]  # 只保留符合条件的列
+            row = row[edge_mask] - node_start  # 只保留符合条件的行，并对行索引进行偏移
+
+    # 创建一个与原数据相同的副本用于存放处理后的数据
+    out = copy.copy(self.data)
+
+    # 对所有图数据的属性进行处理
+    for key, value in self.data.items():
+        if key == 'num_nodes':  # 处理节点数量
+            out.num_nodes = node_length  # 设置当前子图的节点数量
+        elif self.data.is_node_attr(key):  # 处理节点属性
+            cat_dim = self.data.__cat_dim__(key, value)  # 获取该属性的类别维度
+            # 根据节点索引对该属性进行切片，提取当前子图的节点属性
+            out[key] = narrow(value, cat_dim, node_start, node_length)
+        elif self.data.is_edge_attr(key):  # 处理边属性
+            cat_dim = self.data.__cat_dim__(key, value)  # 获取该属性的类别维度
+            # 根据边索引对该属性进行切片，提取当前子图的边属性
+            out[key] = narrow(value, cat_dim, edge_start, edge_length)
+            
+            # 如果不保留集群间的边，则进行筛选，去掉跨集群的边
+            if not self.keep_inter_cluster_edges:
+                out[key] = out[key][edge_mask]  # 根据 edge_mask 对边属性进行筛选
+
+    # 将当前子图的边索引（row 和 col）堆叠成一个 2xE 的张量表示边
+    out.edge_index = torch.stack([row, col], dim=0)
+
+    # 返回当前子图的数据
+    return out
+
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}({self.num_parts})'
+
+
+class ClusterLoader(torch.utils.data.DataLoader):
+    r"""基于 `Cluster-GCN` 论文提出的划分数据加载器，它将多个划分后的子图及其集群间的边链接组合成一个小批量。
+
+    .. note::
+        请配合 `ClusterData` 和 `ClusterLoader` 一起使用，以形成小批量。
+        示例可参考 `examples/cluster_gcn_reddit.py` 或 `examples/cluster_gcn_ppi.py`。
+
+    参数:
+        cluster_data (torch_geometric.loader.ClusterData): 已经划分好的数据对象。
+        **kwargs (可选): 其他 DataLoader 的参数，比如 `batch_size`、`shuffle`、`drop_last` 等。
+    """
+    def __init__(self, cluster_data, **kwargs):
+        self.cluster_data = cluster_data
+        iterator = range(len(cluster_data))
+        super().__init__(iterator, collate_fn=self._collate, **kwargs)
+
+    def _collate(self, batch: List[int]) -> Data:
+        # 拼接当前批次的所有子图数据，并计算新的边连接
+        if not isinstance(batch, torch.Tensor):
+            batch = torch.tensor(batch)
+
+        global_indptr = self.cluster_data.partition.indptr
+        global_index = self.cluster_data.partition.index
+
+        # 获取当前小批量中节点和边的起止索引
+        node_start = self.cluster_data.partition.partptr[batch]
+        node_end = self.cluster_data.partition.partptr[batch + 1]
+        edge_start = global_indptr[node_start]
+        edge_end = global_indptr[node_end]
+
+        rows, cols, nodes, cumsum = [], [], [], 0
+        for i in range(batch.numel()):
+            nodes.append(torch.arange(node_start[i], node_end[i]))
+            indptr = global_indptr[node_start[i]:node_end[i] + 1]
+            indptr = indptr - edge_start[i]
+            if self.cluster_data.partition.sparse_format == 'csr':
+                row = ptr2index(indptr) + cumsum
+                col = global_index[edge_start[i]:edge_end[i]]
+            else:
+                col = ptr2index(indptr) + cumsum
+                row = global_index[edge_start[i]:edge_end[i]]
+
+            rows.append(row)
+            cols.append(col)
+            cumsum += indptr.numel() - 1
+
+        node = torch.cat(nodes, dim=0)
+        row = torch.cat(rows, dim=0)
+        col = torch.cat(cols, dim=0)
+
+        # 仅保留连接同一子图的边
+        if self.cluster_data.partition.sparse_format == 'csr':
+            col, edge_mask = map_index(col, node)
+            row = row[edge_mask]
         else:
-            p1, x1, o1 = pxo1; p2, x2, o2 = pxo2
-            # 将 pxo2 的特征插值到 pxo1 中，以实现上采样
-            x = self.linear1(x1) + pointops.interpolation(p2, p1, self.linear2(x2), o2, o1)
-        return x
+            row, edge_mask = map_index(row, node)
+            col = col[edge_mask]
+        out = copy.copy(self.cluster_data.data)
 
+        # 根据偏移量对节点和边属性进行切片
+        for key, value in self.cluster_data.data.items():
+            if key == 'num_nodes':
+                out.num_nodes = cumsum
+            elif self.cluster_data.data.is_node_attr(key):
+                cat_dim = self.cluster_data.data.__cat_dim__(key, value)
+                out[key] = torch.cat([
+                    narrow(out[key], cat_dim, s, e - s)
+                    for s, e in zip(node_start, node_end)
+                ], dim=cat_dim)
+            elif self.cluster_data.data.is_edge_attr(key):
+                cat_dim = self.cluster_data.data.__cat_dim__(key, value)
+                value = torch.cat([
+                    narrow(out[key], cat_dim, s, e - s)
+                    for s, e in zip(edge_start, edge_end)
+                ], dim=cat_dim)
+                out[key] = select(value, edge_mask, dim=cat_dim)
 
-class PointTransformerBlock(nn.Module):
-    expansion = 1
+        out.edge_index = torch.stack([row, col], dim=0)
 
-    def __init__(self, in_planes, planes, share_planes=8, nsample=16):
-        super(PointTransformerBlock, self).__init__()
-        self.linear1 = nn.Linear(in_planes, planes, bias=False)
-        self.bn1 = nn.BatchNorm1d(planes)
-        self.transformer2 = PointTransformerLayer(planes, planes, share_planes, nsample)
-        self.bn2 = nn.BatchNorm1d(planes)
-        self.linear3 = nn.Linear(planes, planes * self.expansion, bias=False)
-        self.bn3 = nn.BatchNorm1d(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, pxo):
-        p, x, o = pxo  # (n, 3), (n, c), (b)
-        identity = x
-        x = self.relu(self.bn1(self.linear1(x)))
-        x = self.relu(self.bn2(self.transformer2([p, x, o])))
-        x = self.bn3(self.linear3(x))
-        x += identity
-        x = self.relu(x)
-        return [p, x, o]
-
-
-class PointTransformerSeg(nn.Module):
-    def __init__(self, block, blocks, c=6, k=13):
-        super().__init__()
-        self.c = c
-        self.in_planes, planes = c, [32, 64, 128, 256, 512]
-        fpn_planes, fpnhead_planes, share_planes = 128, 64, 8
-        stride, nsample = [1, 4, 4, 4, 4], [8, 16, 16, 16, 16]
-        self.enc1 = self._make_enc(block, planes[0], blocks[0], share_planes, stride=stride[0], nsample=nsample[0])  # N/1
-        self.enc2 = self._make_enc(block, planes[1], blocks[1], share_planes, stride=stride[1], nsample=nsample[1])  # N/4
-        self.enc3 = self._make_enc(block, planes[2], blocks[2], share_planes, stride=stride[2], nsample=nsample[2])  # N/16
-        self.enc4 = self._make_enc(block, planes[3], blocks[3], share_planes, stride=stride[3], nsample=nsample[3])  # N/64
-        self.enc5 = self._make_enc(block, planes[4], blocks[4], share_planes, stride=stride[4], nsample=nsample[4])  # N/256
-        self.dec5 = self._make_dec(block, planes[4], 2, share_planes, nsample=nsample[4], is_head=True)  # transform p5
-        self.dec4 = self._make_dec(block, planes[3], 2, share_planes, nsample=nsample[3])  # fusion p5 and p4
-        self.dec3 = self._make_dec(block, planes[2], 2, share_planes, nsample=nsample[2])  # fusion p4 and p3
-        self.dec2 = self._make_dec(block, planes[1], 2, share_planes, nsample=nsample[1])  # fusion p3 and p2
-        self.dec1 = self._make_dec(block, planes[0], 2, share_planes, nsample=nsample[0])  # fusion p2 and p1
-        self.cls = nn.Sequential(nn.Linear(planes[0], planes[0]), nn.BatchNorm1d(planes[0]), nn.ReLU(inplace=True), nn.Linear(planes[0], k))
-
-    def _make_enc(self, block, planes, blocks, share_planes=8, stride=1, nsample=16):
-        layers = []
-        layers.append(TransitionDown(self.in_planes, planes * block.expansion, stride, nsample))
-        self.in_planes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.in_planes, self.in_planes, share_planes, nsample=nsample))
-        return nn.Sequential(*layers)
-
-    def _make_dec(self, block, planes, blocks, share_planes=8, nsample=16, is_head=False):
-        layers = []
-        layers.append(TransitionUp(self.in_planes, None if is_head else planes * block.expansion))
-        self.in_planes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.in_planes, self.in_planes, share_planes, nsample=nsample))
-        return nn.Sequential(*layers)
-
-    def forward(self, pxo):
-        p0, x0, o0 = pxo  # (n, 3), (n, c), (b)
-        x0 = p0 if self.c == 3 else torch.cat((p0, x0), 1)
-        p1, x1, o1 = self.enc1([p0, x0, o0])
-        p2, x2, o2 = self.enc2([p1, x1, o1])
-        p3, x3, o3 = self.enc3([p2, x2, o2])
-        p4, x4, o4 = self.enc4([p3, x3, o3])
-        p5, x5, o5 = self.enc5([p4, x4, o4])
-        x5 = self.dec5[1:]([p5, self.dec5[0]([p5, x5, o5]), o5])[1]
-        x4 = self.dec4[1:]([p4, self.dec4[0]([p4, x4, o4], [p5, x5, o5]), o4])[1]
-        x3 = self.dec3[1:]([p3, self.dec3[0]([p3, x3, o3], [p4, x4, o4]), o3])[1]
-        x2 = self.dec2[1:]([p2, self.dec2[0]([p2, x2, o2], [p3, x3, o3]), o2])[1]
-        x1 = self.dec1[1:]([p1, self.dec1[0]([p1, x1, o1], [p2, x2, o2]), o1])[1]
-        x = self.cls(x1)
-        return x
-
-
-def pointtransformer_seg_repro(**kwargs):
-    model = PointTransformerSeg(PointTransformerBlock, [2, 3, 4, 6, 3], **kwargs)
-    return model
+        return out
